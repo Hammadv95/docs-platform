@@ -18,6 +18,9 @@ export default function AdminPage() {
   const [slug, setSlug] = useState("");
   const [file, setFile] = useState<File | null>(null);
 
+  // NEW: doc type selector (state regs go to root, pms_report_requests go to folder)
+  const [docType, setDocType] = useState("state_regulation");
+
   const authed = useMemo(() => Boolean(token), [token]);
 
   useEffect(() => {
@@ -88,6 +91,10 @@ export default function AdminPage() {
       fd.append("title", title.trim());
       fd.append("summary", summary || "");
       if (slug.trim()) fd.append("slug", slug.trim());
+
+      // NEW: send doc_type to backend
+      fd.append("doc_type", docType);
+
       fd.append("pdf", file);
 
       const res = await fetch(`${API_BASE}/admin/upload`, {
@@ -108,6 +115,8 @@ export default function AdminPage() {
       setSummary("");
       setSlug("");
       setFile(null);
+      setDocType("state_regulation");
+
       // reset file input UI by forcing refresh
       const fileEl = document.getElementById("pdfFile") as HTMLInputElement | null;
       if (fileEl) fileEl.value = "";
@@ -214,6 +223,19 @@ export default function AdminPage() {
               style={{ width: "100%", padding: 10, marginTop: 4 }}
               placeholder="e.g., lease-agreement-2026"
             />
+          </label>
+
+          {/* NEW: Document type selector */}
+          <label>
+            Document Type
+            <select
+              value={docType}
+              onChange={(e) => setDocType(e.target.value)}
+              style={{ width: "100%", padding: 10, marginTop: 4 }}
+            >
+              <option value="state_regulation">State Regulation (root docs bucket)</option>
+              <option value="pms_report_requests">PMS Report Requests (docs/pms_report_requests/)</option>
+            </select>
           </label>
 
           <label>
