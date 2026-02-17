@@ -1,4 +1,4 @@
-﻿import os
+import os
 import time
 import hashlib
 import uuid
@@ -36,8 +36,10 @@ MEILI_INDEX = os.environ.get("MEILI_INDEX", "documents")
 JWT_SECRET = os.environ.get("ADMIN_JWT_SECRET", "dev-secret-change-me")
 JWT_EXPIRES_MIN = int(os.environ.get("ADMIN_JWT_EXPIRES_MIN", "720"))
 
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Bucket name you showed in Supabase Storage
+STORAGE_BUCKET = os.environ.get("SUPABASE_BUCKET", "docs")
 
+pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 app = FastAPI(title="Docs Website API")
 
 logger = logging.getLogger("uvicorn.error")
@@ -49,6 +51,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------- Utility: storage routing ----------------
+def build_storage_path(doc_type: str, filename: str) -> str:
+    """
+    Rules (per your correction):
+      - state_regulation -> root of bucket (e.g. UUID.pdf)
+      - pms_report_requests -> inside folder pms_report_requests/UUID.pdf
+    """
+    safe_name = filename.strip().replace("\\", "/").split("/")[-1]
+    if doc_type == "pms_report_requests":
+        return f"pms_report_requests/{safe_name}"
+    # default (state_regulation) -> root of bucket
+    return safe_name
+
 
 # ---------------- Supabase REST helpers ----------------
 def sb_headers() -> Dict[str, str]:
@@ -89,6 +105,7 @@ async def sb_update_by_id(table: str, row_id: str, payload: dict) -> dict:
         r.raise_for_status()
         return r.json()[0]
 
+
 # ---------------- Supabase Storage helpers ----------------
 async def sb_storage_upload(bucket: str, path: str, content: bytes, content_type: str) -> None:
     url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}"
@@ -115,9 +132,9 @@ async def sb_storage_download(bucket: str, path: str) -> bytes:
             raise HTTPException(status_code=500, detail=f"Supabase Storage download error {r.status_code}: {r.text}")
         return r.content
 
+
 # ---------------- Meilisearch helpers ----------------
 def meili_headers() -> Dict[str, str]:
-    # Provide both styles; Meili accepts X-Meili-API-Key, and most setups accept Authorization Bearer.
     return {
         "Authorization": f"Bearer {MEILI_MASTER_KEY}",
         "X-Meili-API-Key": MEILI_MASTER_KEY,
@@ -138,13 +155,13 @@ async def meili_setup() -> None:
         elif r.status_code >= 400:
             r.raise_for_status()
 
-        # Set index settings (reliable endpoint)
+        # IMPORTANT: doc_type added as filterable
         sr = await client.put(
             f"{MEILI_URL}/indexes/{MEILI_INDEX}/settings",
             headers=meili_headers(),
             json={
                 "searchableAttributes": ["title", "summary", "content"],
-                "filterableAttributes": ["is_published"],
+                "filterableAttributes": ["is_published", "doc_type"],
                 "sortableAttributes": ["updated_at"],
             },
         )
@@ -167,15 +184,21 @@ async def meili_upsert(doc: dict) -> None:
         )
         r.raise_for_status()
 
-async def meili_search(q: str, limit: int = 20) -> dict:
+async def meili_search(q: str, limit: int = 20, doc_type: Optional[str] = None) -> dict:
+    filter_parts = ["is_published = true"]
+    if doc_type:
+        # Meili filter syntax for string fields:
+        # doc_type = "pms_report_requests"
+        filter_parts.append(f'doc_type = "{doc_type}"')
+
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             f"{MEILI_URL}/indexes/{MEILI_INDEX}/search",
             headers=meili_headers(),
             json={
-                 "q": q,
-                 "limit": limit,
-                 "filter": "is_published = true"
+                "q": q,
+                "limit": limit,
+                "filter": " AND ".join(filter_parts),
             },
         )
         r.raise_for_status()
@@ -186,6 +209,7 @@ async def meili_search(q: str, limit: int = 20) -> dict:
 async def admin_meili_setup():
     await meili_setup()
     return {"ok": True, "index": MEILI_INDEX, "meili_url": MEILI_URL}
+
 
 # ---------------- Auth helpers ----------------
 def make_admin_token(email: str) -> str:
@@ -207,6 +231,7 @@ def require_admin(auth_header: Optional[str]) -> str:
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
 # ---------------- PDF helpers ----------------
 def sha256_bytes(b: bytes) -> str:
     h = hashlib.sha256()
@@ -227,6 +252,7 @@ def extract_pdf_text(pdf_bytes: bytes, max_chars: int = 2_000_000) -> str:
         total += len(parts[-1])
     return "\n".join(parts).strip()
 
+
 # ---------------- Routes ----------------
 @app.get("/")
 async def root():
@@ -240,31 +266,42 @@ async def test_supabase():
         return {"status_code": r.status_code, "response": r.json() if r.status_code == 200 else r.text}
 
 @app.get("/api/search")
-async def search(q: str, limit: int = 20):
+async def search(q: str, limit: int = 20, doc_type: Optional[str] = None):
     q = (q or "").strip()
     if not q:
         return {"query": q, "hits": [], "estimatedTotalHits": 0}
 
-    res = await meili_search(q, limit=limit)
+    res = await meili_search(q, limit=limit, doc_type=doc_type)
     hits = [
         {
             "slug": h["slug"],
             "title": h["title"],
             "summary": h.get("summary", ""),
             "updated_at": h.get("updated_at"),
+            "doc_type": h.get("doc_type"),
         }
         for h in res.get("hits", [])
     ]
     return {"query": q, "hits": hits, "estimatedTotalHits": res.get("estimatedTotalHits", 0)}
 
 @app.get("/api/docs")
-async def list_docs():
-    rows = await sb_list("documents", "?select=slug,title,summary,updated_at&is_published=eq.true&order=updated_at.desc")
+async def list_docs(doc_type: Optional[str] = None):
+    # Public list endpoint, filtered by is_published + optional doc_type
+    base = "??"
+    # Build Supabase REST query
+    query = "?select=slug,title,summary,updated_at,doc_type&is_published=eq.true"
+    if doc_type:
+        query += f"&doc_type=eq.{doc_type}"
+    query += "&order=updated_at.desc"
+    rows = await sb_list("documents", query)
     return {"docs": rows}
 
 @app.get("/api/docs/{slug}")
 async def get_doc(slug: str):
-    row = await sb_select_one("documents", f"?select=slug,title,summary,updated_at,is_published&slug=eq.{slug}&limit=1")
+    row = await sb_select_one(
+        "documents",
+        f"?select=slug,title,summary,updated_at,is_published,doc_type&slug=eq.{slug}&limit=1",
+    )
     if not row or not row.get("is_published"):
         raise HTTPException(status_code=404, detail="Not found")
     row["view_url"] = f"/api/docs/{slug}/view"
@@ -276,11 +313,14 @@ async def view_pdf(slug: str):
     if not row or not row.get("is_published"):
         raise HTTPException(status_code=404, detail="Not found")
 
-    pdf_bytes = await sb_storage_download("docs", row["storage_path"])
+    pdf_bytes = await sb_storage_download(STORAGE_BUCKET, row["storage_path"])
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{row["title"]}.pdf"', "Cache-Control": "private, max-age=0, no-store"},
+        headers={
+            "Content-Disposition": f'inline; filename="{row["title"]}.pdf"',
+            "Cache-Control": "private, max-age=0, no-store",
+        },
     )
 
 @app.post("/admin/login")
@@ -296,6 +336,7 @@ async def admin_upload(
     title: str = Form(...),
     slug: Optional[str] = Form(None),
     summary: str = Form(""),
+    doc_type: str = Form("state_regulation"),  # <-- NEW
     pdf: UploadFile = File(...),
 ):
     require_admin(authorization)
@@ -320,67 +361,70 @@ async def admin_upload(
     extracted = extract_pdf_text(pdf_bytes)
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+    # Use a stable filename (ID.pdf) to avoid collisions, then apply routing rules
     existing = await sb_select_one("documents", f"?select=id,slug&slug=eq.{computed_slug}&limit=1")
+
     if existing:
         doc_id = existing["id"]
-        storage_path = f"{doc_id}.pdf"
-        await sb_storage_upload("docs", storage_path, pdf_bytes, "application/pdf")
-        doc_row = await sb_update_by_id("documents", doc_id, {
-            "title": title,
-            "summary": summary,
-            "storage_path": storage_path,
-            "sha256": digest,
-            "file_size": len(pdf_bytes),
-            "extracted_text": extracted,
-            "updated_at": now_iso,
-            "is_published": True,
-            "slug": computed_slug,
-        })
+        base_filename = f"{doc_id}.pdf"
+        storage_path = build_storage_path(doc_type, base_filename)
+
+        await sb_storage_upload(STORAGE_BUCKET, storage_path, pdf_bytes, "application/pdf")
+        doc_row = await sb_update_by_id(
+            "documents",
+            doc_id,
+            {
+                "title": title,
+                "summary": summary,
+                "storage_path": storage_path,
+                "sha256": digest,
+                "file_size": len(pdf_bytes),
+                "extracted_text": extracted,
+                "updated_at": now_iso,
+                "is_published": True,
+                "slug": computed_slug,
+                "doc_type": doc_type,  # <-- NEW
+            },
+        )
     else:
         doc_id = str(uuid.uuid4())
-        storage_path = f"{doc_id}.pdf"
-        await sb_storage_upload("docs", storage_path, pdf_bytes, "application/pdf")
+        base_filename = f"{doc_id}.pdf"
+        storage_path = build_storage_path(doc_type, base_filename)
 
-        doc_row = await sb_insert("documents", {
-            "id": doc_id,
-            "slug": computed_slug,
-            "title": title,
-            "summary": summary,
-            "is_published": True,
-            "storage_path": storage_path,
-            "sha256": digest,
-            "file_size": len(pdf_bytes),
-            "extracted_text": extracted,
-            "updated_at": now_iso,
-        })
+        await sb_storage_upload(STORAGE_BUCKET, storage_path, pdf_bytes, "application/pdf")
 
-    await meili_upsert({
-        "id": doc_row["id"],
-        "slug": doc_row["slug"],
-        "title": doc_row["title"],
-        "summary": doc_row.get("summary", ""),
-        "updated_at": doc_row.get("updated_at"),
-        "is_published": bool(doc_row.get("is_published", True)),
-        "content": doc_row.get("extracted_text", ""),
-    })
-
-    return {"ok": True, "slug": doc_row["slug"], "url": f"/docs/{doc_row['slug']}"}
-@app.get("/admin/meili/set-filterable-is-published")
-async def set_filterable_is_published():
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.patch(
-            f"{MEILI_URL}/indexes/{MEILI_INDEX}/settings",
-            headers=meili_headers(),
-            json={"filterableAttributes": ["is_published"]},
+        doc_row = await sb_insert(
+            "documents",
+            {
+                "id": doc_id,
+                "slug": computed_slug,
+                "title": title,
+                "summary": summary,
+                "is_published": True,
+                "storage_path": storage_path,
+                "sha256": digest,
+                "file_size": len(pdf_bytes),
+                "extracted_text": extracted,
+                "updated_at": now_iso,
+                "doc_type": doc_type,  # <-- NEW
+            },
         )
 
-    return {
-        "meili_url": MEILI_URL,
-        "index": MEILI_INDEX,
-        "status_code": r.status_code,
-        "text": (r.text or "")[:2000],
-    }
+    # Index into Meilisearch with doc_type
+    await meili_upsert(
+        {
+            "id": doc_row["id"],
+            "slug": doc_row["slug"],
+            "title": doc_row["title"],
+            "summary": doc_row.get("summary", "") or "",
+            "updated_at": doc_row.get("updated_at"),
+            "is_published": bool(doc_row.get("is_published", True)),
+            "doc_type": doc_row.get("doc_type", "state_regulation"),
+            "content": doc_row.get("extracted_text", "") or "",
+        }
+    )
 
+    return {"ok": True, "slug": doc_row["slug"], "url": f"/docs/{doc_row['slug']}"}
 
 # ---------------- Admin: Reindex all docs into Meilisearch ----------------
 @app.post("/admin/reindex")
@@ -389,7 +433,7 @@ async def admin_reindex(authorization: Optional[str] = Header(None)):
 
     rows = await sb_list(
         "documents",
-        "?select=id,slug,title,summary,updated_at,is_published,extracted_text&order=updated_at.desc"
+        "?select=id,slug,title,summary,updated_at,is_published,extracted_text,doc_type&order=updated_at.desc",
     )
 
     batch = []
@@ -397,15 +441,18 @@ async def admin_reindex(authorization: Optional[str] = Header(None)):
 
     async with httpx.AsyncClient(timeout=60) as client:
         for r in rows:
-            batch.append({
-                "id": r["id"],
-                "slug": r["slug"],
-                "title": r["title"],
-                "summary": r.get("summary", "") or "",
-                "updated_at": r.get("updated_at"),
-                "is_published": bool(r.get("is_published", True)),
-                "content": (r.get("extracted_text") or ""),
-            })
+            batch.append(
+                {
+                    "id": r["id"],
+                    "slug": r["slug"],
+                    "title": r["title"],
+                    "summary": (r.get("summary", "") or ""),
+                    "updated_at": r.get("updated_at"),
+                    "is_published": bool(r.get("is_published", True)),
+                    "doc_type": r.get("doc_type", "state_regulation"),
+                    "content": (r.get("extracted_text") or ""),
+                }
+            )
 
             if len(batch) >= 100:
                 resp = await client.post(
